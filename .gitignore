@@ -29,3 +29,5 @@ yarn-error.log
 /.vscode
 /.zed
 CODING_TEST.md
+CLAUDE.md
+.claude
