@@ -1,0 +1,124 @@
+name: Deploy Events App to Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # Quality gate: deploy only runs if these pass.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, bcmath, curl, pdo_sqlite, gd, intl, zip
+          coverage: none
+
+      - name: Install Composer dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Prepare test environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+        # Tests force in-memory SQLite via tests/TestCase.php, so no DB service is needed.
+
+      - name: Check formatting (Pint)
+        run: ./vendor/bin/pint --test app database routes tests
+
+      - name: Run tests (Pest)
+        run: php artisan test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+
+    steps:
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            trap 'echo "❌ Deployment failed at line $LINENO"' ERR
+
+            # Adjust if the checkout lives elsewhere on the server.
+            APP_DIR="/var/www/events-app"
+
+            echo "➡️ Go to app directory"
+            cd "$APP_DIR"
+
+            echo "➡️ Require a .env (managed on the server, never committed)"
+            if [ ! -f .env ]; then
+              echo "❌ .env not found in $APP_DIR — create it before deploying."
+              exit 1
+            fi
+
+            echo "➡️ Pull latest code"
+            git fetch origin
+            git reset --hard origin/main
+
+            echo "➡️ Ensure Composer exists"
+            if ! command -v composer &> /dev/null; then
+              echo "⚠️ Composer not found, bootstrapping composer.phar"
+              php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+              php composer-setup.php --quiet
+              rm composer-setup.php
+              COMPOSER="php composer.phar"
+            else
+              COMPOSER="composer"
+            fi
+
+            echo "➡️ Install PHP dependencies"
+            $COMPOSER install --no-dev --optimize-autoloader --no-interaction
+
+            echo "➡️ Build frontend (Inertia/Vue assets -> public/build)"
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            if command -v npm &> /dev/null; then
+              npm ci
+              npm run build
+            else
+              echo "❌ npm not found — the app needs compiled assets (public/build). Aborting."
+              exit 1
+            fi
+
+            echo "➡️ Enable maintenance mode"
+            php artisan down || true
+
+            echo "➡️ Run migrations"
+            php artisan migrate --force
+
+            echo "➡️ Link public storage (locally-served event images)"
+            php artisan storage:link || true
+
+            echo "➡️ Rebuild caches"
+            php artisan optimize:clear
+            php artisan optimize
+
+            echo "➡️ Reload queue workers so they pick up new code"
+            php artisan queue:restart || true
+
+            echo "➡️ Fix permissions"
+            chown -R www-data:www-data storage bootstrap/cache
+            chmod -R 775 storage bootstrap/cache
+
+            echo "➡️ Reload PHP-FPM"
+            systemctl reload php8.3-fpm || true
+
+            echo "➡️ Disable maintenance mode"
+            php artisan up || true
+
+            echo "✅ Deployment completed"
