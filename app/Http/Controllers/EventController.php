@@ -2,29 +2,42 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\EventListingRequest;
 use App\Models\Event;
-use Illuminate\Contracts\Pagination\LengthAwarePaginator;
+use App\Services\EventListingService;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Http\Request;
 use Inertia\Inertia;
 use Inertia\Response;
 
 class EventController extends Controller
 {
-    public function index(Request $request): Response
+    public function index(EventListingService $listing): Response
     {
         return Inertia::render('Events/Index', [
-            'filters' => [
-                'status' => $request->status,
-                'from' => $request->input('from', '2023-01-01'),
-            ],
-            'statuses' => ['draft', 'published', 'cancelled', 'sold_out'],
+            'statuses' => EventListingService::STATUSES,
+            'filterOptions' => $listing->filterOptions(),
         ]);
     }
 
-    public function data(Request $request): JsonResponse
+    public function visualOne(EventListingService $listing): Response
     {
-        [$events, $stats] = $this->loadListing($request);
+        return Inertia::render('Events/VisualOne', [
+            'statuses' => EventListingService::STATUSES,
+            'filterOptions' => $listing->filterOptions(),
+        ]);
+    }
+
+    public function visualTwo(EventListingService $listing): Response
+    {
+        return Inertia::render('Events/VisualTwo', [
+            'statuses' => EventListingService::STATUSES,
+            'filterOptions' => $listing->filterOptions(),
+        ]);
+    }
+
+    public function data(EventListingRequest $request, EventListingService $listing): JsonResponse
+    {
+        [$events, $stats] = $listing->paginate($request->filters());
 
         return response()->json([
             'data' => $events->items(),
@@ -37,31 +50,10 @@ class EventController extends Controller
 
     public function show(Event $event): Response
     {
-        $event->load('user');
+        $event->load(['user', 'images']);
 
         return Inertia::render('Events/Show', [
             'event' => $event,
         ]);
-    }
-
-    /**
-     * @return array{0: LengthAwarePaginator, 1: array{ms: int, bytes: int}}
-     */
-    private function loadListing(Request $request): array
-    {
-        $start = microtime(true);
-
-        $events = Event::with('user')
-            ->when($request->status, fn ($q, $s) => $q->where('status', $s))
-            ->orderByDesc('created_time')
-            ->paginate(50)
-            ->withQueryString();
-
-        $stats = [
-            'ms' => (int) round((microtime(true) - $start) * 1000),
-            'bytes' => strlen((string) json_encode($events->items())),
-        ];
-
-        return [$events, $stats];
     }
 }

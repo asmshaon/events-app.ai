@@ -35,4 +35,10 @@ return [
         ],
     ],
 
+    'geocoder' => [
+        'enabled' => env('GEOCODER_ENABLED', true),
+        'url' => env('GEOCODER_URL', 'https://nominatim.openstreetmap.org'),
+        'user_agent' => env('GEOCODER_USER_AGENT', 'events-app.ai/1.0 (coding-test)'),
+    ],
+
 ];

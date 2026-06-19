@@ -2,9 +2,11 @@
 
 namespace Database\Seeders;
 
+use App\Services\ReverseGeocoder;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Storage;
 
 class EventSeeder extends Seeder
 {
@@ -15,6 +17,9 @@ class EventSeeder extends Seeder
     public const PAYLOAD_AVG_BYTES = 1500;
 
     public const NUM_USERS = 3000;
+
+    /** Only this many events get real event_images rows; the rest fall back to a placeholder. */
+    public const IMAGE_SUBSET_ROWS = 2000;
 
     private const CHUNK = 4000;
 
@@ -64,7 +69,7 @@ class EventSeeder extends Seeder
 
     public function run(): void
     {
-        $rows = (int) (env('SEED_ROWS', 1_250_000));
+        $rows = (int) (env('SEED_ROWS', 100));
 
         $this->command?->info("Seeding {$rows} events...");
 
@@ -73,6 +78,7 @@ class EventSeeder extends Seeder
         $this->withSeedingPragmas(function () use ($rows) {
             $this->ensureUsers();
             $this->insertEvents($rows);
+            $this->seedEventImages();
         });
 
         $elapsed = round(microtime(true) - $start, 1);
@@ -103,6 +109,7 @@ class EventSeeder extends Seeder
         $typeWeights = $this->cumulativeWeights([20, 14, 22, 12, 12, 8, 8, 4]);
         $statusWeights = $this->cumulativeWeights([12, 70, 8, 10]);
         $anchorCount = count(self::CITY_ANCHORS);
+        $anchorGeo = $this->resolveAnchorLocations();
 
         $remaining = $count;
         $done = 0;
@@ -117,7 +124,9 @@ class EventSeeder extends Seeder
                 $startsAt = mt_rand($startTime, $endTime);
                 $endsAt = $startsAt + mt_rand(3600, 3 * 24 * 3600);
 
-                $anchor = self::CITY_ANCHORS[mt_rand(0, $anchorCount - 1)];
+                $anchorIndex = mt_rand(0, $anchorCount - 1);
+                $anchor = self::CITY_ANCHORS[$anchorIndex];
+                $geo = $anchorGeo[$anchorIndex];
                 $latitude = round($anchor[0] + (mt_rand(-500, 500) / 1000), 7);
                 $longitude = round($anchor[1] + (mt_rand(-500, 500) / 1000), 7);
 
@@ -146,6 +155,12 @@ class EventSeeder extends Seeder
                     'created_time' => $startsAt,
                     'latitude' => $latitude,
                     'longitude' => $longitude,
+                    'starts_at' => date('Y-m-d H:i:s', $startsAt),
+                    'ends_at' => date('Y-m-d H:i:s', $endsAt),
+                    'timezone' => $geo['timezone'],
+                    'address' => $geo['address'],
+                    'city' => $geo['city'],
+                    'country' => $geo['country'],
                     'payload' => $payload,
                     'created_at' => $now,
                     'updated_at' => $now,
@@ -163,6 +178,108 @@ class EventSeeder extends Seeder
                 $this->command?->getOutput()?->writeln("  inserted {$done}/{$count}");
             }
         }
+    }
+
+    /**
+     * Reverse-geocode each city anchor once (cached in `geocoded_locations`).
+     * Every seeded event borrows its anchor's resolved location, so the whole
+     * dataset costs at most one lookup per anchor rather than one per row.
+     *
+     * @return array<int, array{address: ?string, city: ?string, country: ?string, timezone: string}>
+     */
+    private function resolveAnchorLocations(): array
+    {
+        $geocoder = app(ReverseGeocoder::class);
+
+        $this->command?->info('Resolving '.count(self::CITY_ANCHORS).' location anchors...');
+
+        $resolved = [];
+        foreach (self::CITY_ANCHORS as $index => [$lat, $lng]) {
+            $resolved[$index] = $geocoder->lookup($lat, $lng);
+        }
+
+        return $resolved;
+    }
+
+    /**
+     * Attach locally-served placeholder images to the first IMAGE_SUBSET_ROWS
+     * events (2-3 each). Idempotent: skips entirely once any images exist.
+     */
+    private function seedEventImages(): void
+    {
+        if (DB::table('event_images')->exists()) {
+            $this->command?->info('Event images already seeded; skipping.');
+
+            return;
+        }
+
+        $eventIds = DB::table('events')->limit(self::IMAGE_SUBSET_ROWS)->pluck('id');
+        if ($eventIds->isEmpty()) {
+            return;
+        }
+
+        $placeholders = $this->ensurePlaceholderImages();
+        $poolSize = count($placeholders);
+        $now = date('Y-m-d H:i:s');
+
+        $batch = [];
+        foreach ($eventIds as $i => $eventId) {
+            $imageCount = 2 + ($i % 2); // alternate 2 and 3 images per event
+            for ($s = 0; $s < $imageCount; $s++) {
+                $batch[] = [
+                    'event_id' => $eventId,
+                    'path' => $placeholders[($i + $s) % $poolSize],
+                    'sort_order' => $s,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ];
+            }
+
+            if (count($batch) >= self::CHUNK) {
+                DB::table('event_images')->insert($batch);
+                $batch = [];
+            }
+        }
+
+        if ($batch !== []) {
+            DB::table('event_images')->insert($batch);
+        }
+
+        $this->command?->info("Seeded images for {$eventIds->count()} events.");
+    }
+
+    /**
+     * Write a small pool of placeholder SVGs to the public disk (once) and
+     * return their relative paths. SVGs keep the seed self-contained — no
+     * binary assets to commit, and they're served locally via storage:link.
+     *
+     * @return array<int, string>
+     */
+    private function ensurePlaceholderImages(): array
+    {
+        $disk = Storage::disk('public');
+        $palette = ['#6366f1', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6'];
+
+        $paths = [];
+        foreach ($palette as $i => $color) {
+            $path = 'events/placeholders/event-'.($i + 1).'.svg';
+            if (! $disk->exists($path)) {
+                $disk->put($path, $this->placeholderSvg($color, $i + 1));
+            }
+            $paths[] = $path;
+        }
+
+        return $paths;
+    }
+
+    private function placeholderSvg(string $color, int $n): string
+    {
+        return <<<SVG
+        <svg xmlns="http://www.w3.org/2000/svg" width="800" height="450" viewBox="0 0 800 450">
+            <rect width="800" height="450" fill="{$color}"/>
+            <text x="400" y="225" font-family="sans-serif" font-size="44" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">Event Image {$n}</text>
+        </svg>
+        SVG;
     }
 
     private function ensureUsers(): void
@@ -260,8 +377,8 @@ class EventSeeder extends Seeder
     private function uuidv4(): string
     {
         $data = random_bytes(16);
-        $data[6] = chr((ord($data[6]) & 0x0f) | 0x40);
-        $data[8] = chr((ord($data[8]) & 0x3f) | 0x80);
+        $data[6] = chr((ord($data[6]) & 0x0F) | 0x40);
+        $data[8] = chr((ord($data[8]) & 0x3F) | 0x80);
 
         return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
     }
