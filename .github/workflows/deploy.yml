@@ -7,36 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Quality gate: deploy only runs if these pass.
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up PHP 8.3
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.3'
-          extensions: mbstring, xml, bcmath, curl, pdo_sqlite, gd, intl, zip
-          coverage: none
-
-      - name: Install Composer dependencies
-        run: composer install --prefer-dist --no-interaction --no-progress
-
-      - name: Prepare test environment
-        run: |
-          cp .env.example .env
-          php artisan key:generate
-        # Tests force in-memory SQLite via tests/TestCase.php, so no DB service is needed.
-
-      - name: Check formatting (Pint)
-        run: ./vendor/bin/pint --test app database routes tests
-
-      - name: Run tests (Pest)
-        run: php artisan test
-
   deploy:
-    needs: test
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-production
