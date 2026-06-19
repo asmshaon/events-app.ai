@@ -11,13 +11,24 @@ use Illuminate\Support\Facades\Mail;
 
 class SendEventReminders extends Command
 {
-    protected $signature = 'events:send-reminders';
+    protected $signature = 'events:send-reminders {--days= : Local testing only — fire 3-day reminders for every published event starting within this many days from now}';
 
     protected $description = 'Queue reminder emails for attendees of upcoming events (3 days and 24 hours out).';
 
     public function handle(): int
     {
         $now = now();
+
+        // Testing override: widen the lookahead so reminders fire immediately for
+        // far-out seeded events (e.g. --days=1825 for ~5 years). Skips the real
+        // window logic; sends a single 3-day reminder per attendee.
+        if ($this->option('days') !== null) {
+            $days = (int) $this->option('days');
+            $sent = $this->dispatchWindow(ReminderType::ThreeDay, $now, $now->copy()->addDays($days));
+            $this->info("Queued {$sent} reminder email(s) for events within {$days} day(s).");
+
+            return self::SUCCESS;
+        }
 
         // Non-overlapping windows so an attendee gets each reminder once, at the
         // right time: 24h covers the next day, 3-day covers days 1-3.
